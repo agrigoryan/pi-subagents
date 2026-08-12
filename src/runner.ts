@@ -15,11 +15,15 @@ export const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 export const MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
 
 export interface RunResult {
+	id: string;
 	agent: string;
 	source: "user" | "project" | "unknown";
 	task: string;
-	/** -1 while running, process exit code once finished */
+	cwd: string;
+	/** -1 while queued/running, process exit code once finished */
 	exitCode: number;
+	startedAt?: number;
+	completedAt?: number;
 	messages: Message[];
 	stderr: string;
 	usage: Usage;
@@ -31,6 +35,7 @@ export interface RunResult {
 }
 
 export interface RunOptions {
+	id: string;
 	agentName: string;
 	source: "user" | "project";
 	task: string;
@@ -40,7 +45,7 @@ export interface RunOptions {
 	thinking?: string;
 	tools?: string[];
 	signal?: AbortSignal;
-	onEvent?: () => void;
+	onEvent?: (result: RunResult) => void;
 }
 
 export function emptyUsage(): Usage {
@@ -75,9 +80,11 @@ export function finalText(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (msg.role !== "assistant") continue;
-		for (const part of msg.content) {
-			if (part.type === "text" && part.text.trim()) return part.text;
-		}
+		const text = msg.content
+			.filter((part) => part.type === "text" && part.text.trim())
+			.map((part) => (part as { type: "text"; text: string }).text)
+			.join("\n");
+		if (text) return text;
 	}
 	return "";
 }
@@ -98,10 +105,13 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 export async function runAgent(options: RunOptions): Promise<RunResult> {
 	const result: RunResult = {
+		id: options.id,
 		agent: options.agentName,
 		source: options.source,
 		task: options.task,
+		cwd: options.cwd,
 		exitCode: -1,
+		startedAt: Date.now(),
 		messages: [],
 		stderr: "",
 		usage: emptyUsage(),
@@ -109,6 +119,7 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
 		contextTokens: 0,
 		model: options.model,
 	};
+	options.onEvent?.(result);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (options.model) args.push("--model", options.model);
@@ -138,6 +149,17 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
 			});
 
 			let buffer = "";
+			const seenToolResults = new Set<string>();
+			let closed = false;
+			let killTimer: NodeJS.Timeout | undefined;
+			let abortHandler: (() => void) | undefined;
+			const settle = (code: number) => {
+				if (closed) return;
+				closed = true;
+				if (killTimer) clearTimeout(killTimer);
+				if (options.signal && abortHandler) options.signal.removeEventListener("abort", abortHandler);
+				resolve(code);
+			};
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
 				let event: any;
@@ -148,6 +170,11 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
 				}
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message as Message;
+					if (msg.role === "toolResult") {
+						if (seenToolResults.has(msg.toolCallId)) return;
+						seenToolResults.add(msg.toolCallId);
+						if (msg.usage) addUsage(result.usage, msg.usage);
+					}
 					result.messages.push(msg);
 					if (msg.role === "assistant") {
 						result.turns++;
@@ -159,10 +186,16 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
 						if (msg.stopReason) result.stopReason = msg.stopReason;
 						if (msg.errorMessage) result.errorMessage = msg.errorMessage;
 					}
-					options.onEvent?.();
+					options.onEvent?.(result);
 				} else if (event.type === "tool_result_end" && event.message) {
-					result.messages.push(event.message as Message);
-					options.onEvent?.();
+					const msg = event.message as Message;
+					if (msg.role === "toolResult") {
+						if (seenToolResults.has(msg.toolCallId)) return;
+						seenToolResults.add(msg.toolCallId);
+						if (msg.usage) addUsage(result.usage, msg.usage);
+					}
+					result.messages.push(msg);
+					options.onEvent?.(result);
 				}
 			};
 
@@ -177,31 +210,35 @@ export async function runAgent(options: RunOptions): Promise<RunResult> {
 			});
 			proc.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				settle(code ?? 1);
 			});
 			proc.on("error", (err) => {
 				result.stderr += `${result.stderr ? "\n" : ""}spawn failed: ${err.message}`;
-				resolve(1);
+				settle(1);
 			});
 
 			if (options.signal) {
-				const kill = () => {
+				abortHandler = () => {
+					if (closed) return;
 					wasAborted = true;
 					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000).unref();
+					killTimer = setTimeout(() => {
+						if (!closed && proc.exitCode === null) proc.kill("SIGKILL");
+					}, 5000);
+					killTimer.unref();
 				};
-				if (options.signal.aborted) kill();
-				else options.signal.addEventListener("abort", kill, { once: true });
+				if (options.signal.aborted) abortHandler();
+				else options.signal.addEventListener("abort", abortHandler, { once: true });
 			}
 		});
 
 		result.exitCode = exitCode;
+		result.completedAt = Date.now();
 		if (wasAborted) {
 			result.stopReason = "aborted";
 			result.errorMessage ??= "Subagent was aborted";
 		}
+		options.onEvent?.(result);
 		return result;
 	} finally {
 		if (tmpDir) fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});

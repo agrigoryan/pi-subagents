@@ -51,28 +51,38 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
-		if (!frontmatter.name || !frontmatter.description) continue;
+		try {
+			const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
+			const name = typeof frontmatter.name === "string" ? frontmatter.name.trim() : "";
+			const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
+			if (!name || !description) continue;
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t) => t.trim())
-			.filter(Boolean);
-		const thinking =
-			frontmatter.thinking && THINKING_LEVELS.has(frontmatter.thinking.trim())
-				? frontmatter.thinking.trim()
-				: undefined;
+			const rawTools = frontmatter.tools;
+			const tools = (Array.isArray(rawTools)
+				? rawTools.filter((tool): tool is string => typeof tool === "string")
+				: typeof rawTools === "string"
+					? rawTools.split(",")
+					: [])
+				.map((tool) => tool.trim())
+				.filter(Boolean);
+			const rawThinking = typeof frontmatter.thinking === "string" ? frontmatter.thinking.trim() : "";
+			const thinking = THINKING_LEVELS.has(rawThinking) ? rawThinking : undefined;
+			const model = typeof frontmatter.model === "string" ? frontmatter.model.trim() || undefined : undefined;
 
-		agents.push({
-			name: frontmatter.name,
-			description: frontmatter.description,
-			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model?.trim() || undefined,
-			thinking,
-			systemPrompt: body,
-			source,
-			filePath,
-		});
+			agents.push({
+				name,
+				description,
+				tools: tools.length > 0 ? tools : undefined,
+				model,
+				thinking,
+				systemPrompt: body,
+				source,
+				filePath,
+			});
+		} catch {
+			// A malformed definition must not prevent discovery of the other agents.
+			continue;
+		}
 	}
 	return agents;
 }

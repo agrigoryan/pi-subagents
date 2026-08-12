@@ -18,6 +18,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_BYTES, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type AgentConfig, discoverAgents, formatRoster } from "./agents.ts";
+import { openSubagentInspector } from "./inspector.ts";
 import { renderCallView, renderResultView, type SubagentDetails } from "./render.ts";
 import {
 	addUsage,
@@ -67,9 +68,33 @@ export default function (pi: ExtensionAPI) {
 	const maxDepth = Number.parseInt(process.env[MAX_DEPTH_ENV] ?? "1", 10) || 1;
 	if (depth >= maxDepth) return; // running inside a subagent: no further delegation
 
+	type FailurePatch = { details: SubagentDetails; usage: Usage };
+	const failurePatches = new Map<string, FailurePatch>();
+
+	// Throwing is required for pi to mark a tool call as failed. Restore the
+	// transcript and nested usage that pi's generic thrown-error result omits.
+	pi.on("tool_result", (event) => {
+		if (event.toolName !== "subagent") return;
+		const patch = failurePatches.get(event.toolCallId);
+		if (!patch) return;
+		failurePatches.delete(event.toolCallId);
+		return patch;
+	});
+
 	pi.registerCommand("subagents", {
-		description: "List available subagent definitions",
-		handler: async (_args, ctx) => {
+		description: "Browse subagent sessions (/subagents agents lists definitions)",
+		getArgumentCompletions: (prefix) => {
+			const options = [
+				{ value: "agents", label: "agents", description: "List available agent definitions" },
+			];
+			const matches = options.filter((option) => option.value.startsWith(prefix.trim()));
+			return matches.length > 0 ? matches : null;
+		},
+		handler: async (args, ctx) => {
+			if (args.trim() !== "agents") {
+				await openSubagentInspector(ctx);
+				return;
+			}
 			const discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
 			const lines = [
 				`User agents dir: ${discovery.userDir}`,
@@ -96,7 +121,7 @@ export default function (pi: ExtensionAPI) {
 		].join("\n"),
 		parameters: SubagentParams,
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
 			const agents = discovery.agents;
 
@@ -122,10 +147,12 @@ export default function (pi: ExtensionAPI) {
 			const dispatchModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 			const dispatchThinking = ctx.thinkingLevel;
 
-			const results: RunResult[] = requested.map((item) => ({
+			const results: RunResult[] = requested.map((item, index) => ({
+				id: `${toolCallId}:${index + 1}`,
 				agent: item.agent,
 				source: agents.find((a) => a.name === item.agent)?.source ?? "unknown",
 				task: item.task,
+				cwd: item.cwd ?? ctx.cwd,
 				exitCode: -1,
 				messages: [],
 				stderr: "",
@@ -150,20 +177,33 @@ export default function (pi: ExtensionAPI) {
 			await Promise.all(
 				requested.map((item, index) =>
 					withSlot(async () => {
-						const agent = agents.find((a) => a.name === item.agent) as AgentConfig;
-						const inheritsModel = !agent.model;
-						results[index] = await runAgent({
-							agentName: agent.name,
-							source: agent.source,
-							task: item.task,
-							systemPrompt: agent.systemPrompt,
-							cwd: item.cwd ?? ctx.cwd,
-							model: agent.model ?? dispatchModel,
-							thinking: agent.thinking ?? (inheritsModel ? dispatchThinking : undefined),
-							tools: agent.tools,
-							signal,
-							onEvent: emitUpdate,
-						});
+						try {
+							const agent = agents.find((a) => a.name === item.agent) as AgentConfig;
+							const inheritsModel = !agent.model;
+							results[index] = await runAgent({
+								id: results[index].id,
+								agentName: agent.name,
+								source: agent.source,
+								task: item.task,
+								systemPrompt: agent.systemPrompt,
+								cwd: item.cwd ?? ctx.cwd,
+								model: agent.model ?? dispatchModel,
+								thinking: agent.thinking ?? (inheritsModel ? dispatchThinking : undefined),
+								tools: agent.tools,
+								signal,
+								onEvent: (current) => {
+									results[index] = current;
+									emitUpdate();
+								},
+							});
+						} catch (error) {
+							const failed = results[index];
+							failed.exitCode = 1;
+							failed.completedAt = Date.now();
+							failed.stopReason = signal?.aborted ? "aborted" : "error";
+							failed.errorMessage = error instanceof Error ? error.message : String(error);
+							failed.stderr ||= failed.errorMessage;
+						}
 						emitUpdate();
 					}),
 				),
@@ -173,12 +213,17 @@ export default function (pi: ExtensionAPI) {
 			for (const result of results) addUsage(usage, result.usage);
 			const details: SubagentDetails = { mode, results };
 
-			if (signal?.aborted) throw new Error("Subagent run was aborted");
+			const fail = (message: string): never => {
+				failurePatches.set(toolCallId, { details, usage });
+				throw new Error(message);
+			};
+
+			if (signal?.aborted) fail("Subagent run was aborted");
 
 			if (mode === "single") {
 				const result = results[0];
 				if (isFailed(result)) {
-					throw new Error(`Agent ${result.stopReason || "failed"}: ${truncateForModel(resultOutput(result))}`);
+					fail(`Agent ${result.stopReason || "failed"}: ${truncateForModel(resultOutput(result))}`);
 				}
 				return {
 					content: [{ type: "text", text: truncateForModel(resultOutput(result)) }],
@@ -190,10 +235,14 @@ export default function (pi: ExtensionAPI) {
 			const okCount = results.filter((r) => !isFailed(r)).length;
 			const sections = results.map((result) => {
 				const status = isFailed(result) ? `failed${result.stopReason ? ` (${result.stopReason})` : ""}` : "completed";
-				return `### [${result.agent}] ${status}\n\n${truncateForModel(resultOutput(result))}`;
+				return `### [${result.agent}] ${status}\n\n${resultOutput(result)}`;
 			});
+			const output = truncateForModel(
+				`Parallel: ${okCount}/${results.length} succeeded\n\n${sections.join("\n\n---\n\n")}`,
+			);
+			if (okCount === 0) fail(output);
 			return {
-				content: [{ type: "text", text: `Parallel: ${okCount}/${results.length} succeeded\n\n${sections.join("\n\n---\n\n")}` }],
+				content: [{ type: "text", text: output }],
 				details,
 				usage,
 			} satisfies AgentToolResult<SubagentDetails>;

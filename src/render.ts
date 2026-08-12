@@ -13,8 +13,6 @@ export interface SubagentDetails {
 	results: RunResult[];
 }
 
-const COLLAPSED_ITEMS = 8;
-
 type ThemeLike = {
 	fg(color: any, text: string): string;
 	bold(text: string): string;
@@ -32,9 +30,13 @@ export function usageLine(result: RunResult): string {
 	if (result.usage.input) parts.push(`↑${formatTokens(result.usage.input)}`);
 	if (result.usage.output) parts.push(`↓${formatTokens(result.usage.output)}`);
 	if (result.usage.cost.total) parts.push(`$${result.usage.cost.total.toFixed(4)}`);
+	if (result.startedAt) {
+		const elapsed = Math.max(0, (result.completedAt ?? Date.now()) - result.startedAt);
+		parts.push(elapsed < 1000 ? `${elapsed}ms` : `${Math.round(elapsed / 1000)}s`);
+	}
 	if (result.contextTokens) parts.push(`ctx:${formatTokens(result.contextTokens)}`);
 	if (result.model) parts.push(result.model);
-	return parts.join(" ");
+	return parts.join(" · ");
 }
 
 type TrailItem = { type: "text"; text: string } | { type: "tool"; name: string; args: Record<string, any> };
@@ -81,24 +83,21 @@ function formatToolCall(name: string, args: Record<string, unknown>, theme: Them
 }
 
 function statusIcon(result: RunResult, theme: ThemeLike): string {
-	if (result.exitCode === -1) return theme.fg("warning", "⏳");
+	if (result.exitCode === -1) return result.startedAt ? theme.fg("accent", "●") : theme.fg("muted", "○");
 	return isFailed(result) ? theme.fg("error", "✗") : theme.fg("success", "✓");
 }
 
-function renderTrailLines(result: RunResult, theme: ThemeLike, limit: number): string {
-	const items = trail(result);
-	const shown = items.slice(-limit);
-	let text = "";
-	if (items.length > shown.length) text += theme.fg("muted", `... ${items.length - shown.length} earlier items\n`);
-	for (const item of shown) {
-		if (item.type === "text") {
-			const preview = item.text.split("\n").slice(0, 2).join("\n");
-			text += `${theme.fg("toolOutput", preview)}\n`;
-		} else {
-			text += `${theme.fg("muted", "→ ")}${formatToolCall(item.name, item.args, theme)}\n`;
-		}
-	}
-	return text.trimEnd();
+function compactTask(task: string, max = 64): string {
+	const oneLine = task.replace(/\s+/g, " ").trim();
+	return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
+function activityLine(result: RunResult, theme: ThemeLike): string | undefined {
+	const item = trail(result).at(-1);
+	if (!item) return undefined;
+	if (item.type === "tool") return formatToolCall(item.name, item.args, theme);
+	const preview = compactTask(item.text, 70);
+	return preview ? theme.fg("toolOutput", preview) : undefined;
 }
 
 export function renderCallView(args: any, theme: ThemeLike): Text {
@@ -163,13 +162,18 @@ export function renderResultView(
 	if (details.mode === "single") {
 		const result = details.results[0];
 		if (expanded) return renderSingleExpanded(result, theme);
-		let text = `${statusIcon(result, theme)} ${theme.fg("toolTitle", theme.bold(result.agent))}${theme.fg("muted", ` (${result.source})`)}`;
-		if (isFailed(result) && result.stopReason) text += ` ${theme.fg("error", `[${result.stopReason}]`)}`;
-		if (isFailed(result) && result.errorMessage) text += `\n${theme.fg("error", `Error: ${result.errorMessage}`)}`;
-		const lines = renderTrailLines(result, theme, COLLAPSED_ITEMS);
-		text += lines ? `\n${lines}` : `\n${theme.fg("muted", result.exitCode === -1 ? "(running...)" : "(no output)")}`;
+		const state = result.exitCode === -1 ? (result.startedAt ? "running" : "queued") : isFailed(result) ? "failed" : "completed";
+		let text = `${statusIcon(result, theme)} ${theme.fg("toolTitle", theme.bold(result.agent))} ${theme.fg("muted", state)}`;
+		if (isFailed(result) && result.stopReason) text += ` ${theme.fg("error", `(${result.stopReason})`)}`;
+		if (result.exitCode === -1) {
+			const activity = activityLine(result, theme);
+			if (activity) text += `\n  ${theme.fg("muted", "↳ ")}${activity}`;
+		} else if (isFailed(result) && result.errorMessage) {
+			text += `\n  ${theme.fg("error", compactTask(result.errorMessage, 100))}`;
+		}
 		const usage = usageLine(result);
-		if (usage) text += `\n${theme.fg("dim", usage)}`;
+		if (usage) text += `\n  ${theme.fg("dim", usage)}`;
+		if (result.exitCode !== -1) text += `\n  ${theme.fg("dim", "/subagents to inspect transcript")}`;
 		return new Text(text, 0, 0);
 	}
 
@@ -178,33 +182,30 @@ export function renderResultView(
 	const runningCount = results.filter((r) => r.exitCode === -1).length;
 	const okCount = results.filter((r) => r.exitCode !== -1 && !isFailed(r)).length;
 	const failCount = results.filter((r) => r.exitCode !== -1 && isFailed(r)).length;
-	const icon = runningCount > 0 ? theme.fg("warning", "⏳") : failCount > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
+	const icon = runningCount > 0 ? theme.fg("accent", "●") : failCount > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
 	const status =
 		runningCount > 0
-			? `${okCount + failCount}/${results.length} done, ${runningCount} running`
-			: `${okCount}/${results.length} tasks`;
+			? `${okCount + failCount}/${results.length} done · ${runningCount} active`
+			: `${okCount}/${results.length} completed`;
 
 	if (expanded && runningCount === 0) {
 		const container = new Container();
-		container.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`, 0, 0));
+		container.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold("subagents "))}${theme.fg("accent", status)}`, 0, 0));
 		for (const result of results) {
 			container.addChild(new Spacer(1));
 			container.addChild(new Text(`${theme.fg("muted", "─── ")}${theme.fg("accent", result.agent)} ${statusIcon(result, theme)}`, 0, 0));
-			const inner = renderSingleExpanded(result, theme);
-			container.addChild(inner);
+			container.addChild(renderSingleExpanded(result, theme));
 		}
 		return container;
 	}
 
-	let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
+	let text = `${icon} ${theme.fg("toolTitle", theme.bold("subagents "))}${theme.fg("accent", status)}`;
 	for (const result of results) {
-		text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", result.agent)} ${statusIcon(result, theme)}`;
-		const lines = renderTrailLines(result, theme, 4);
-		text += lines ? `\n${lines}` : `\n${theme.fg("muted", result.exitCode === -1 ? "(running...)" : "(no output)")}`;
-		if (result.exitCode !== -1) {
-			const usage = usageLine(result);
-			if (usage) text += `\n${theme.fg("dim", usage)}`;
-		}
+		const usage = usageLine(result);
+		const activity = result.exitCode === -1 ? activityLine(result, theme) : undefined;
+		const suffix = activity ?? (usage ? theme.fg("dim", usage) : theme.fg("dim", compactTask(result.task, 48)));
+		text += `\n  ${statusIcon(result, theme)} ${theme.fg("accent", result.agent)}${suffix ? ` ${theme.fg("muted", "·")} ${suffix}` : ""}`;
 	}
+	if (runningCount === 0) text += `\n  ${theme.fg("dim", "/subagents to inspect transcripts")}`;
 	return new Text(text, 0, 0);
 }

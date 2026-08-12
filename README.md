@@ -10,11 +10,11 @@ Design rationale and the research behind it: [`_docs/`](./_docs/) (subagent impl
   - single: `{ agent, task, cwd? }`
   - parallel: `{ tasks: [{ agent, task, cwd? }, ...] }` — max 8 tasks, 4 concurrent (process-wide semaphore, also bounds sibling tool calls)
 - Each subagent runs as a separate `pi --mode json -p --no-session` process: fresh context, full isolation, only the task text crosses the boundary.
-- **Live progress**: child tool activity streams into the parent TUI (collapsed trail + usage line; Ctrl+O expands to full task, tool trail, markdown output).
+- **Minimal live UI**: one compact row per child shows queued/running/completed state, current activity, duration, tokens, and cost. Ctrl+O expands the tool result.
+- **Navigable transcript inspector**: `/subagents` opens a two-pane session browser; ↑/↓ selects a child and PgUp/PgDn scrolls its task, tool calls/results, and assistant messages. `/subagents agents` lists definitions and sources.
 - **Usage roll-up**: child token/cost usage is returned as tool `usage`, so pi's session totals include delegated spend.
-- Output to the parent model capped at 50KB (full transcript preserved in tool details); errors reported with `isError`, never disguised as findings.
+- Output to the parent model is capped at 50KB across the whole tool result (full transcripts remain in tool details); failed runs preserve their transcript and usage.
 - Abort propagates: Esc/Ctrl+C → SIGTERM → SIGKILL after 5s.
-- **`/subagents` command** lists discovered agents and their sources.
 
 ## Agent definitions
 
@@ -70,7 +70,8 @@ Sample agents: `scout` (read-only recon), `worker` (full-capability implementati
 src/index.ts    extension entry: depth guard, tool + /subagents command
 src/agents.ts   agent discovery (user + trust-gated project)
 src/runner.ts   pi subprocess spawn, JSONL streaming, semaphore, abort
-src/render.ts   TUI rendering (collapsed/expanded, single/parallel)
+src/render.ts   minimal collapsed + expanded tool rendering
+src/inspector.ts keyboard-navigable transcript browser (`/subagents`)
 agents/         sample agent definitions
 _docs/          research + design docs
 ```

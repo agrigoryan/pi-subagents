@@ -11,13 +11,14 @@
 - Dynamic agent roster in the tool description + self-contained-prompt guidance (all three major harnesses do this).
 - Fresh, isolated child context via subprocess `pi --mode json -p --no-session`.
 - Model/thinking inheritance from the dispatching session when the agent doesn't pin one.
-- Live streaming progress (child tool activity + usage) via `onUpdate`; collapsed/expanded TUI rendering.
+- Live streaming progress (child tool activity + usage) via `onUpdate`; compact-by-default tool rendering with Ctrl+O expansion.
+- A small `/subagents` transcript inspector: keyboard navigation across child runs stored in parent tool details, without introducing background-job or resumable-session machinery.
 - Recursion guard via the ecosystem-standard `PI_SUBAGENT_DEPTH` env (children don't get the tool by default).
 - Concurrency semaphore (4) shared process-wide (covers sibling tool calls too), 8 tasks/call cap.
 - 50KB output truncation (pi's `truncateHead`), full transcript in `details`.
 - Child usage returned as `usage` → parent session totals include child spend (the official example omits this).
 - Abort: SIGTERM → SIGKILL after 5s.
-- `/subagents` command listing discovered agents + source.
+- `/subagents` opens stored child transcripts; `/subagents agents` lists discovered definitions and sources.
 
 **Non-goals** (the maximalist tarpit; see doc 02 §6): background execution/notifications, steering, chains (prompt templates can orchestrate sequential calls), missions/budgets/watchdogs, worktrees, inter-agent messaging, scheduling.
 
@@ -28,6 +29,7 @@
 | Subprocess (JSON mode) over in-process SDK | Battle-tested (official example), full isolation, survives parent quirks, zero coupling to runtime internals; startup cost acceptable |
 | Trust-gated project agents, no confirm param | pi already has a trust store; the example's `confirmProjectAgents` is model-controllable (the model could pass `false`) and silently skipped headless |
 | No chain mode | Sequential = the model calls the tool again with the previous result in the prompt; `{previous}` string substitution added complexity without engine value |
+| Parent-details inspector, not persisted child sessions | The existing transcript is enough for navigation. Keeping `--no-session` avoids resume/switch lifecycle complexity while giving users visibility into each run. |
 | Depth guard at extension load | If `PI_SUBAGENT_DEPTH` ≥ `PI_SUBAGENT_MAX_DEPTH` (default 1), the tool isn't registered at all — the child model can't even see it (amos-style: restriction before schema, not advisory) |
 | `usage` on the tool result | pi rolls it into footer//session/RPC totals — real cost visibility for delegated work |
 | Roster embedded at register + rediscovered at execute | Description gives the model the roster upfront; fresh discovery per call allows editing agents mid-session |
@@ -79,7 +81,8 @@ System prompt appended to pi's default prompt...
 src/index.ts     extension entry: depth guard, registerTool, /subagents command
 src/agents.ts    discovery + frontmatter parsing (trust-aware)
 src/runner.ts    subprocess spawn, JSONL streaming, abort, usage accumulation
-src/render.ts    renderCall/renderResult (collapsed/expanded, single + parallel)
+src/render.ts    compact renderCall/renderResult (expanded details on Ctrl+O)
+src/inspector.ts /subagents two-pane transcript browser
 agents/          sample agents: scout, worker, reviewer
 ```
 

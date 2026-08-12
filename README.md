@@ -7,8 +7,8 @@ Design rationale and the research behind it: [`_docs/`](./_docs/) (subagent impl
 ## What it does
 
 - **`subagent` tool** with two modes:
-  - single: `{ agent, task, cwd? }`
-  - parallel: `{ tasks: [{ agent, task, cwd? }, ...] }` — max 8 tasks, 4 concurrent (process-wide semaphore, also bounds sibling tool calls)
+  - single: `{ agent, task, cwd?, model?, thinking? }`
+  - parallel: `{ tasks: [{ agent, task, cwd?, model?, thinking? }, ...] }` — max 8 tasks, 4 concurrent (process-wide semaphore, also bounds sibling tool calls)
 - Each subagent runs as a separate `pi --mode json -p --no-session` process: fresh context, full isolation, only the task text crosses the boundary.
 - **Minimal live UI**: one compact row per child shows queued/running/completed state, current activity, duration, tokens, and cost. Ctrl+O expands the tool result.
 - **Navigable transcript inspector**: `/subagents` opens a two-pane session browser; ↑/↓ selects a child and PgUp/PgDn scrolls its task, tool calls/results, and assistant messages. `/subagents agents` lists definitions and sources.
@@ -37,6 +37,12 @@ You are a scout agent...
 | `model` | any pi model pattern; omitted → inherits the dispatching session's model **and** thinking level |
 | `thinking` | `off\|minimal\|low\|medium\|high\|xhigh\|max`; honored with pinned or inherited model |
 
+`model` and `thinking` may also be supplied per call, including on each parallel task. Resolution order is **per-call override → agent frontmatter → dispatching session**. Parent agents are instructed to use per-call overrides only when the user explicitly requests them.
+
+```json
+{"agent":"reviewer","task":"Review this repository","model":"openai/gpt-5.5","thinking":"high"}
+```
+
 **Discovery** (re-run fresh on every call, so you can edit agents mid-session):
 - `~/.pi/agent/agents/*.md` — user agents, always loaded
 - `.pi/agents/*.md` — nearest project dir walking up from cwd; loaded **only when the project is trusted** (pi's trust store / `-a`); overrides user agents by name
@@ -62,7 +68,7 @@ cp agents/*.md ~/.pi/agent/agents/
 pi -e ./src/index.ts
 ```
 
-Sample agents: `scout` (read-only recon), `worker` (full-capability implementation), `reviewer` (read-only code review).
+Sample agents: `scout` (read-only recon), `planner` (read-only implementation planning), `worker` (full-capability implementation), `reviewer` (read-only code review).
 
 ## Layout
 

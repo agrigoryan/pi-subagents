@@ -2,8 +2,8 @@
  * pi-subagents — delegate tasks to isolated subagents.
  *
  * One `subagent` tool with two modes:
- *   single:   { agent, task, cwd? }
- *   parallel: { tasks: [{ agent, task, cwd? }, ...] }   (max 8, 4 concurrent)
+ *   single:   { agent, task, cwd?, model?, thinking? }
+ *   parallel: { tasks: [{ agent, task, cwd?, model?, thinking? }, ...] }   (max 8, 4 concurrent)
  *
  * Each subagent runs as a separate `pi --mode json -p --no-session` process with
  * a fresh context. Agent definitions are markdown files with YAML frontmatter in
@@ -33,16 +33,25 @@ import {
 	withSlot,
 } from "./runner.ts";
 
+const ThinkingLevel = Type.Union(
+	["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => Type.Literal(level)),
+	{ description: "Thinking-level override" },
+);
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to run" }),
 	task: Type.String({ description: "Task for the agent. Must be fully self-contained." }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent (defaults to current)" })),
+	model: Type.Optional(Type.String({ minLength: 1, description: "Per-call model override (defaults to the agent definition, then the parent model)" })),
+	thinking: Type.Optional(ThinkingLevel),
 });
 
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Agent name (single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (single mode)" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory (single mode)" })),
+	model: Type.Optional(Type.String({ minLength: 1, description: "Per-call model override (single mode)" })),
+	thinking: Type.Optional(ThinkingLevel),
 	tasks: Type.Optional(
 		Type.Array(TaskItem, {
 			description: `Independent tasks to run in parallel (parallel mode, max ${MAX_PARALLEL_TASKS})`,
@@ -114,7 +123,8 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate a task to a specialized subagent with its own isolated context window.",
 			"Use it when a side task (broad codebase search, research, review, an independent implementation step) would flood your context with output you won't reference again.",
-			"Modes: single ({agent, task}) or parallel ({tasks: [{agent, task}, ...]}) for independent tasks.",
+			"Modes: single ({agent, task, model?, thinking?}) or parallel ({tasks: [{agent, task, model?, thinking?}, ...]}) for independent tasks.",
+			"Model and thinking overrides are optional and should be set when the user explicitly requests them. Precedence is per-call override, then agent definition, then the dispatching session.",
 			"The subagent only receives your task text — no conversation history. Write self-contained tasks: include relevant file paths, prior findings, constraints, and state exactly what the agent should return.",
 			"Do not delegate trivial lookups you can do with one or two direct tool calls.",
 			"Available agents:\n" + rosterSnapshot(pi),
@@ -133,7 +143,9 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const requested = hasSingle ? [{ agent: params.agent!, task: params.task!, cwd: params.cwd }] : params.tasks!;
+			const requested = hasSingle
+				? [{ agent: params.agent!, task: params.task!, cwd: params.cwd, model: params.model, thinking: params.thinking }]
+				: params.tasks!;
 			if (requested.length > MAX_PARALLEL_TASKS) {
 				throw new Error(`Too many parallel tasks (${requested.length}). Max is ${MAX_PARALLEL_TASKS}.`);
 			}
@@ -179,7 +191,6 @@ export default function (pi: ExtensionAPI) {
 					withSlot(async () => {
 						try {
 							const agent = agents.find((a) => a.name === item.agent) as AgentConfig;
-							const inheritsModel = !agent.model;
 							results[index] = await runAgent({
 								id: results[index].id,
 								agentName: agent.name,
@@ -187,8 +198,8 @@ export default function (pi: ExtensionAPI) {
 								task: item.task,
 								systemPrompt: agent.systemPrompt,
 								cwd: item.cwd ?? ctx.cwd,
-								model: agent.model ?? dispatchModel,
-								thinking: agent.thinking ?? (inheritsModel ? dispatchThinking : undefined),
+								model: item.model ?? agent.model ?? dispatchModel,
+								thinking: item.thinking ?? agent.thinking ?? dispatchThinking,
 								tools: agent.tools,
 								signal,
 								onEvent: (current) => {

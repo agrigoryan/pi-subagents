@@ -38,20 +38,23 @@
 
 ```ts
 subagent({
-  agent?: string,   // single mode
-  task?: string,    // single mode
-  cwd?: string,     // single mode, optional working dir
-  tasks?: [{ agent, task, cwd? }],  // parallel mode (max 8)
+  agent?: string,     // single mode
+  task?: string,      // single mode
+  cwd?: string,       // single mode, optional working dir
+  model?: string,     // optional per-call override
+  thinking?: string,  // optional per-call override
+  tasks?: [{ agent, task, cwd?, model?, thinking? }],  // parallel mode (max 8)
 })
 // exactly one of (agent+task) | tasks
+// model/thinking precedence: per-call override → agent frontmatter → dispatching session
 ```
 
 ## Child invocation
 
 ```
 pi --mode json -p --no-session \
-   [--model <frontmatter | parent provider/id>] \
-   [--thinking <frontmatter | parent level (only when model inherited)>] \
+   [--model <per-call | frontmatter | parent provider/id>] \
+   [--thinking <per-call | frontmatter | parent level>] \
    [--tools <frontmatter allowlist>] \
    --append-system-prompt <tmpfile 0600 with agent body> \
    "Task: <task>"
@@ -83,7 +86,7 @@ src/agents.ts    discovery + frontmatter parsing (trust-aware)
 src/runner.ts    subprocess spawn, JSONL streaming, abort, usage accumulation
 src/render.ts    compact renderCall/renderResult (expanded details on Ctrl+O)
 src/inspector.ts /subagents two-pane transcript browser
-agents/          sample agents: scout, worker, reviewer
+agents/          sample agents: scout, planner, worker, reviewer
 ```
 
 Install: `~/.pi/agent/extensions/` symlink, `pi -e`, or `pi install git:...` (package.json `pi.extensions` entry).
